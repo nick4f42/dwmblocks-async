@@ -11,6 +11,7 @@ A [`dwm`](https://dwm.suckless.org) status bar that has a modular, async design,
     - [Clickable](#clickable-blocks)
     - Loaded asynchronously
     - [Updates can be externally triggered](#signalling-changes)
+    - Specified with program arguments
 - Compatible with `i3blocks` scripts
 
 > Additionally, this build of `dwmblocks` is more optimized and fixes the flickering of the status bar when scrolling.
@@ -58,43 +59,33 @@ To set `dwmblocks-async` as your status bar, you need to run it as a background 
 
 ```sh
 # The binary of `dwmblocks-async` is named `dwmblocks`
-dwmblocks &
+dwmblocks \
+    -- 5 0 awk '{print "cpu:" $1}' /proc/loadavg \
+    -- 1 0 date '+%a %b %-d %H:%M' &
 ```
 
-### Modifying the blocks
-You can define your status bar blocks in `config.h`:
-
-```c
-const Block blocks[] = {
-    ...
-    BLOCK("volume", 0,    5),
-    BLOCK("date",   1800, 1),
-    ...
-}
+```sh
+dwmblocks [options] (-- interval signal program args...)...
 ```
 
-Each block has the following properties:
+For each block, the command `program args...` is run every `interval` seconds.
+The block can be manually triggered by sending user signal `signal` to the
+process.
 
-Property|Description
--|-
-Command | The command you wish to execute in your block.
-Update interval | Time in seconds, after which you want the block to update. If `0`, the block will never be updated.
-Update signal | Signal to be used for triggering the block. Must be a positive integer. If `0`, a signal won't be set up for the block and it will be unclickable.
+The general options are:
 
-Additional parameters can be modified:
+```
+--cmdlength=X
+    Maximum possible length of output from block, expressed in number of characters.
 
-```c
-// Maximum possible length of output from block, expressed in number of characters.
-#define CMDLENGTH 50
+--delimiter=X
+    The status bar's delimiter that appears in between each block.
 
-// The status bar's delimiter that appears in between each block.
-#define DELIMITER " "
+--leading-delim
+    Adds a leading delimiter to the status bar, useful for powerline.
 
-// Adds a leading delimiter to the status bar, useful for powerline.
-#define LEADING_DELIMITER
-
-// Enable clickability for blocks. See the "Clickable blocks" section below.
-#define CLICKABLE_BLOCKS
+--clickable
+    Enable clickability for blocks. See the "Clickable blocks" section below.
 ```
 
 ### Signalling changes
@@ -109,11 +100,7 @@ To refresh all the blocks, run `kill -10 $(pidof dwmblocks)` or `pkill -SIGUSR1 
 ### Clickable blocks
 Like `i3blocks`, this build allows you to build in additional actions into your scripts in response to click events. You can check out [my status bar scripts](https://github.com/UtkarshVerma/dotfiles/tree/main/.local/bin/statusbar) as references for using the `$BLOCK_BUTTON` variable.
 
-To use this feature, define the `CLICKABLE_BLOCKS` feature macro in your `config.h`:
-
-```c
-#define CLICKABLE_BLOCKS
-```
+To use this feature, pass the `--clickable` argument before any blocks.
 
 Apart from that, you need `dwm` to be patched with [statuscmd](https://dwm.suckless.org/patches/statuscmd/).
 

@@ -7,50 +7,56 @@
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <time.h>
+#include <limits.h>
+#include <errno.h>
 #include <unistd.h>
 
 #define LEN(arr) (sizeof(arr) / sizeof(arr[0]))
 #define MAX(a, b) (a > b ? a : b)
-#define BLOCK(cmd, interval, signal) \
-    { "echo \"$(" cmd ")\"", interval, signal }
 
-typedef const struct {
-    const char *command;
-    const unsigned int interval;
-    const unsigned int signal;
+typedef struct {
+    unsigned int interval;
+    unsigned int signal;
+    char **argv;
 } Block;
-#include "config.h"
 
-#ifdef CLICKABLE_BLOCKS
-#undef CLICKABLE_BLOCKS
-#define CLICKABLE_BLOCKS 1
-#else
-#define CLICKABLE_BLOCKS 0
-#endif
+static const char *argsep = "--";
 
-#ifdef LEADING_DELIMITER
-#undef LEADING_DELIMITER
-#define LEADING_DELIMITER 1
-#else
-#define LEADING_DELIMITER 0
-#endif
+#define CLICKABLE_ARG "--clickable"
+#define LEADING_DELIM_ARG "--leading-delim"
+#define DELIMITER_ARG "--delimiter"
+#define CMDLENGTH_ARG "--cmdlength"
+#define DEBUG_ARG "--debug"
+
+#define CMDLENGTH_MAX 4096
+
+static int blockCount;
+static Block *blocks;
+static const char *delimiter = "  ";
+static int cmdlength = 64;
+static int clickableBlocks;
+static int leadingDelim;
+
+static int outputSize;
+static char *outputs;
+static int blockBufferSize;
+static char *blockBuffer;
+static char *statusBar[2];
+static int (*pipes)[2];
+static struct epoll_event *events;
 
 static Display *dpy;
 static Window root;
 static unsigned short statusContinue = 1;
 static struct epoll_event event;
-static int pipes[LEN(blocks)][2];
 static int timer = 0, timerTick = 0, maxInterval = 1;
 static int signalFD;
 static int epollFD;
 static int execLock = 0;
 
-// Longest UTF-8 character is 4 bytes long
-static char outputs[LEN(blocks)][CMDLENGTH * 4 + 1 + CLICKABLE_BLOCKS];
-static char
-    statusBar[2]
-             [LEN(blocks) * (LEN(outputs[0]) - 1) +
-              (LEN(blocks) - 1 + LEADING_DELIMITER) * (LEN(DELIMITER) - 1) + 1];
+void usage() {
+    fputs("usage: dwmblocks [options] (-- interval signal prog arg...)...\n", stderr);
+}
 
 void (*writeStatus)();
 
@@ -81,13 +87,14 @@ void execBlock(int i, const char *button) {
         close(pipes[i][1]);
 
         if (button) setenv("BLOCK_BUTTON", button, 1);
-        execl("/bin/sh", "sh", "-c", blocks[i].command, (char *)NULL);
+        char **argv = blocks[i].argv;
+        execvp(argv[0], argv);
         exit(EXIT_FAILURE);
     }
 }
 
 void execBlocks(unsigned int time) {
-    for (int i = 0; i < LEN(blocks); i++)
+    for (int i = 0; i < blockCount; i++)
         if (time == 0 ||
             (blocks[i].interval != 0 && time % blocks[i].interval == 0))
             execBlock(i, NULL);
@@ -97,57 +104,53 @@ int getStatus(char *new, char *old) {
     strcpy(old, new);
     new[0] = '\0';
 
-    for (int i = 0; i < LEN(blocks); i++) {
-#if LEADING_DELIMITER
-        if (strlen(outputs[i]))
-#else
-        if (strlen(new) && strlen(outputs[i]))
-#endif
-            strcat(new, DELIMITER);
-        strcat(new, outputs[i]);
+    for (int i = 0; i < blockCount; i++) {
+        char *output = &outputs[i * outputSize];
+        if (leadingDelim && *output ||
+            !leadingDelim && *new && *output) {
+            strcat(new, delimiter);
+        }
+        strcat(new, output);
     }
     return strcmp(new, old);
 }
 
 void updateBlock(int i) {
-    char *output = outputs[i];
-    char buffer[LEN(outputs[0]) - CLICKABLE_BLOCKS];
-    int bytesRead = read(pipes[i][0], buffer, LEN(buffer));
+    char *output = &outputs[i * outputSize];
+    int bytesRead = read(pipes[i][0], blockBuffer, blockBufferSize);
 
     // Trim UTF-8 string to desired length
     int count = 0, j = 0;
-    while (buffer[j] != '\n' && count < CMDLENGTH) {
+    while (blockBuffer[j] != '\n' && count < cmdlength) {
         count++;
 
         // Skip continuation bytes, if any
-        char ch = buffer[j];
+        char ch = blockBuffer[j];
         int skip = 1;
         while ((ch & 0xc0) > 0x80) ch <<= 1, skip++;
         j += skip;
     }
 
     // Cache last character and replace it with a trailing space
-    char ch = buffer[j];
-    buffer[j] = ' ';
+    char ch = blockBuffer[j];
+    blockBuffer[j] = ' ';
 
     // Trim trailing spaces
-    while (j >= 0 && buffer[j] == ' ') j--;
-    buffer[j + 1] = 0;
+    while (j >= 0 && blockBuffer[j] == ' ') j--;
+    blockBuffer[j + 1] = 0;
 
     // Clear the pipe
-    if (bytesRead == LEN(buffer)) {
+    if (bytesRead == blockBufferSize) {
         while (ch != '\n' && read(pipes[i][0], &ch, 1) == 1)
             ;
     }
 
-#if CLICKABLE_BLOCKS
-    if (bytesRead > 1 && blocks[i].signal > 0) {
+    if (clickableBlocks && bytesRead > 1 && blocks[i].signal > 0) {
         output[0] = blocks[i].signal;
         output++;
     }
-#endif
 
-    strcpy(output, buffer);
+    strcpy(output, blockBuffer);
 
     // Remove execution lock for the current block
     execLock &= ~(1 << i);
@@ -197,7 +200,7 @@ void signalHandler() {
             return;
     }
 
-    for (int j = 0; j < LEN(blocks); j++) {
+    for (int j = 0; j < blockCount; j++) {
         if (blocks[j].signal == signal - SIGRTMIN) {
             char button[4];  // value can't be more than 255;
             sprintf(button, "%d", info.ssi_int & 0xff);
@@ -216,13 +219,13 @@ void setupSignals() {
     sigaddset(&handledSignals, SIGALRM);
 
     // Append all block signals to `handledSignals`
-    for (int i = 0; i < LEN(blocks); i++)
+    for (int i = 0; i < blockCount; i++)
         if (blocks[i].signal > 0)
             sigaddset(&handledSignals, SIGRTMIN + blocks[i].signal);
 
     // Create a signal file descriptor for epoll to watch
     signalFD = signalfd(-1, &handledSignals, 0);
-    event.data.u32 = LEN(blocks);
+    event.data.u32 = blockCount;
     epoll_ctl(epollFD, EPOLL_CTL_ADD, signalFD, &event);
 
     // Block all realtime and handled signals
@@ -245,12 +248,11 @@ void statusLoop() {
     // Update all blocks initially
     raise(SIGALRM);
 
-    struct epoll_event events[LEN(blocks) + 1];
     while (statusContinue) {
-        int eventCount = epoll_wait(epollFD, events, LEN(events), -1);
+        int eventCount = epoll_wait(epollFD, events, blockCount + 1, -1);
         for (int i = 0; i < eventCount; i++) {
             unsigned short id = events[i].data.u32;
-            if (id < LEN(blocks))
+            if (id < blockCount)
                 updateBlock(id);
             else
                 signalHandler();
@@ -261,10 +263,10 @@ void statusLoop() {
 }
 
 void init() {
-    epollFD = epoll_create(LEN(blocks));
+    epollFD = epoll_create(blockCount);
     event.events = EPOLLIN;
 
-    for (int i = 0; i < LEN(blocks); i++) {
+    for (int i = 0; i < blockCount; i++) {
         // Append each block's pipe to `epollFD`
         pipe(pipes[i]);
         event.data.u32 = i;
@@ -280,15 +282,195 @@ void init() {
     setupSignals();
 }
 
-int main(const int argc, const char *argv[]) {
+void freeBlocks() {
+    for (int i = 0; i < blockCount; i++)
+        free(blocks[i].argv);
+
+    free(blocks);
+    free(outputs);
+    free(blockBuffer);
+    free(statusBar[0]);
+    free(pipes);
+    free(events);
+}
+
+int setupBlocks(int nargs, char *args[]) {
+    blockCount = nargs >= 3;
+    for (int i = 2; i < nargs; i++) {
+        if (!strcmp(argsep, args[i])) {
+            i += 3;
+            if (i < nargs) {
+                blockCount++;
+            } else {
+                fputs("dwmblocks: trailing args:", stderr);
+                for (int j = i - 3; j < nargs; j++) {
+                    fprintf(stderr, " %s", args[j]);
+                }
+                fputc('\n', stderr);
+                usage();
+                return 0;
+            }
+        }
+    }
+
+    if (blockCount == 0) {
+        fprintf(stderr, "dwmblocks: No blocks specified\n");
+        usage();
+        return 0;
+    }
+
+    blocks = calloc(blockCount, sizeof(Block));
+
+    outputSize = cmdlength * 4 + clickableBlocks + 1;
+    outputs = malloc(blockCount * outputSize * sizeof(char));
+
+    blockBufferSize = outputSize - clickableBlocks;
+    blockBuffer = malloc(blockBufferSize * sizeof(*blockBuffer));
+
+    int statusBarSize = blockCount * (outputSize - 1) +
+              (blockCount - 1 + leadingDelim) * strlen(delimiter) + 1;
+    statusBar[0] = malloc(2 * statusBarSize * sizeof(char));
+    statusBar[1] = &statusBar[0][statusBarSize];
+
+    pipes = malloc(blockCount * sizeof(*pipes));
+    events = malloc((blockCount + 1) * sizeof(*events));
+
+    if (!blocks || !outputs || !blockBuffer || !statusBar[0] || !pipes || !events) {
+        free(blocks);
+        free(outputs);
+        free(blockBuffer);
+        free(statusBar[0]);
+        free(pipes);
+        free(events);
+        fprintf(stderr, "dwmblocks: Alloc failed\n");
+        return 0;
+    }
+
+    int err = 0;
+    int iBlock = 0;
+    unsigned int interval = 0;
+    unsigned int signal = 0;
+    const char **blockArgs;
+    for (int i = 0; i + 2 < nargs;) {
+
+        char *endptr;
+
+        errno = 0;
+        char *intervalArg = args[i];
+        long intervalLong = strtol(args[i], &endptr, 0);
+        if (errno != 0 || intervalArg == endptr
+            || intervalLong < 0 || intervalLong > UINT_MAX) {
+            fprintf(stderr, "dwmblocks: Invalid interval: %s\n", intervalArg);
+            err = 1;
+            break;
+        }
+
+        errno = 0;
+        char *signalArg = args[i + 1];
+        long signalLong = strtol(signalArg, &endptr, 0);
+        if (errno != 0 || signalArg == endptr
+            || signalLong < 0 || signalLong > UINT_MAX) {
+            fprintf(stderr, "dwmblocks: Invalid signal: %s\n", signalArg);
+            err = 1;
+            break;
+        }
+
+        Block block;
+        block.interval = (unsigned int)intervalLong;
+        block.signal = (unsigned int)signalLong;
+
+        int j;
+        for (j = i + 2; j < nargs; j++) {
+            if (!strcmp(argsep, args[j]))
+                break;
+        }
+
+        int argc = j - (i + 2);
+        block.argv = malloc((argc + 1) * sizeof(*block.argv));
+        if (!block.argv) {
+            fprintf(stderr, "dwmblocks: Alloc failed\n");
+            err = 1;
+            break;
+        }
+
+        memcpy(block.argv, &args[i + 2], argc * sizeof(*block.argv));
+        block.argv[argc] = NULL;
+
+        i = j + 1;
+        blocks[iBlock++] = block;
+    }
+
+    if (err) {
+        while (iBlock > 0) {
+            free(blocks[--iBlock].argv);
+        }
+        free(blocks);
+        free(outputs);
+        free(blockBuffer);
+        free(statusBar[0]);
+        free(pipes);
+        free(events);
+        return 0;
+    }
+
+    return 1;
+}
+
+int main(int argc, char *argv[]) {
     if (setupX()) {
         fprintf(stderr, "dwmblocks: Failed to open display\n");
         return 1;
     }
 
+    int argi;
+
     writeStatus = setRoot;
-    for (int i = 0; i < argc; i++)
-        if (!strcmp("-d", argv[i])) writeStatus = debug;
+    for (argi = 1; argi < argc; argi++) {
+        const char *arg = argv[argi];
+        if (!strcmp(argsep, arg)) {
+            break;
+        } else if (!strcmp(CLICKABLE_ARG, arg)) {
+            clickableBlocks = 1;
+        } else if (!strcmp(LEADING_DELIM_ARG, arg)) {
+            leadingDelim = 1;
+        } else if (!strncmp(DELIMITER_ARG, arg, LEN(DELIMITER_ARG) - 1)) {
+            if (arg[LEN(DELIMITER_ARG) - 1] == '=') {
+                delimiter = &arg[LEN(DELIMITER_ARG)];
+            } else {
+                argi++;
+                delimiter = argi < argc ? argv[argi] : "";
+            }
+        } else if (!strncmp(CMDLENGTH_ARG, arg, LEN(CMDLENGTH_ARG) - 1)) {
+            const char *num;
+            if (arg[LEN(CMDLENGTH_ARG) - 1] == '=') {
+                num = &arg[LEN(CMDLENGTH_ARG)];
+            } else {
+                argi++;
+                if (argi >= argc)
+                    break;
+                num = argv[argi];
+            }
+
+            errno = 0;
+            char *endptr;
+            long len = strtol(num, &endptr, 0);
+            if (errno != 0 || num == endptr || len < 0 || len > CMDLENGTH_MAX) {
+                fprintf(stderr, "dwmblocks: invalid cmdlength: %s\n", num);
+                return 1;
+            }
+            cmdlength = (int)len;
+        } else if (!strcmp(DEBUG_ARG, arg)) {
+            writeStatus = debug;
+        } else {
+            fprintf(stderr, "invalid argument: %s\n", arg);
+            usage();
+            return 1;
+        }
+    }
+
+    if (!setupBlocks(argc - (argi + 1), &argv[argi + 1])) {
+        return 1;
+    }
 
     init();
     statusLoop();
@@ -296,7 +478,9 @@ int main(const int argc, const char *argv[]) {
     XCloseDisplay(dpy);
     close(epollFD);
     close(signalFD);
-    for (int i = 0; i < LEN(pipes); i++) closePipe(pipes[i]);
+    for (int i = 0; i < blockCount; i++) closePipe(pipes[i]);
+
+    freeBlocks();
 
     return 0;
 }
